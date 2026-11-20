@@ -1,39 +1,31 @@
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react-swc";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 import path from "path";
-import { createRequire } from "module";
+import type { Plugin } from "vite";
 
-// @trezor/connect-plugin-stellar 9.2.6 imports "@trezor/utils/libESM/bigNumber",
-// a deep path that @trezor/utils' exports map does not expose. Resolve it from the
-// importing package instead of from our own src/, so it works under every package
-// manager layout (npm hoisting, bun, and pnpm's strict symlinked node_modules).
-function trezorBigNumber(): Plugin {
-  const BROKEN_ID = '@trezor/utils/libESM/bigNumber';
-  return {
-    name: 'trezor-bignumber-resolver',
-    enforce: 'pre',
-    resolveId(source, importer) {
-      if (source !== BROKEN_ID || !importer) return null;
-      try {
-        // "./lib/bigNumber" *is* in the exports map; swap the CJS build for the ESM one.
-        const cjs = createRequire(importer).resolve('@trezor/utils/lib/bigNumber');
-        return cjs.replace(/lib([\\/])bigNumber\.js$/, 'libESM$1bigNumber.js');
-      } catch {
-        return null;
-      }
-    },
-  };
-}
+// index.html allows no inline script. The dev server injects one (the React Refresh preamble),
+// so only there is the policy relaxed; builds keep it strict.
+const allowInlineScriptsInDev = (): Plugin => ({
+  name: "dev-csp-inline-scripts",
+  apply: "serve",
+  transformIndexHtml: (html) => html.replace("script-src 'self';", "script-src 'self' 'unsafe-inline';"),
+});
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  // `/` on a domain of its own, `/<repository>/` on Radicle Pages, see the Makefile.
+  base: process.env.BASE_PATH ?? "/",
   server: {
-    host: "::",
+    // Local only: the dev server serves every file in the project. `npm run dev -- --host`
+    // exposes it on the network when testing from a phone.
+    host: "localhost",
     port: 8080,
   },
   build: {
     target: 'es2020',
+    // Font files stay files: the CSP allows fonts from this origin only, not data: URIs.
+    assetsInlineLimit: (file) => (/\.woff2?$/.test(file) ? false : undefined),
     sourcemap: true,
     rollupOptions: {
       output: {
@@ -52,7 +44,6 @@ export default defineConfig({
     },
   },
   plugins: [
-    trezorBigNumber(),
     nodePolyfills({
       include: ['buffer', 'process', 'crypto'],
       globals: {
@@ -62,6 +53,7 @@ export default defineConfig({
       },
     }),
     react(),
+    allowInlineScriptsInDev(),
   ],
   define: {
     global: 'globalThis',
@@ -74,7 +66,6 @@ export default defineConfig({
   },
 
   optimizeDeps: {
-    include: ["buffer", "process", "@stellar/stellar-base"],
-    exclude: ["@trezor/connect-plugin-stellar"],
+    include: ["buffer", "process"],
   },
 });

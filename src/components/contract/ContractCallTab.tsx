@@ -6,6 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { ContractAddressInput } from './ContractAddressInput';
 import { ContractFunctionForm } from './ContractFunctionForm';
 import {
+  errorMessage,
   loadContractSpec,
   type LoadedContract,
   type NetworkType,
@@ -22,6 +23,8 @@ interface ContractCallTabProps {
   onBuild: (xdr: string) => void;
   isBuilding: boolean;
   isTransactionBuilt: boolean;
+  /** Called whenever the contract, function or an argument changes, so a transaction built before is not signed. */
+  onClearTransaction?: () => void;
 }
 
 export const ContractCallTab = ({
@@ -30,6 +33,7 @@ export const ContractCallTab = ({
   onBuild,
   isBuilding,
   isTransactionBuilt,
+  onClearTransaction,
 }: ContractCallTabProps) => {
   const [address, setAddress] = useState('');
   const [loading, setLoading] = useState(false);
@@ -49,6 +53,7 @@ export const ContractCallTab = ({
   const handleLoad = async (force = false) => {
     const contractId = address.trim();
     if (!contractId) return;
+    onClearTransaction?.();
     setLoading(true);
     setError('');
     setLoaded(null);
@@ -60,14 +65,30 @@ export const ContractCallTab = ({
       pushRecentContract(network, contractId);
       setRecents(getRecentContracts(network));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load contract');
+      setError(errorMessage(e, 'Failed to load contract'));
     } finally {
       setLoading(false);
     }
   };
 
+  const handleSelectFunction = (name: string) => {
+    setSelectedFn(name);
+    onClearTransaction?.();
+  };
+
+  // Once the address no longer names the loaded contract, its functions (and any transaction
+  // built from them) must go: Build would otherwise call the old contract.
+  const handleAddressChange = (value: string) => {
+    setAddress(value);
+    if (loaded && value.trim() !== loaded.contractId) {
+      setLoaded(null);
+      setSelectedFn('');
+      onClearTransaction?.();
+    }
+  };
+
   const handleSelectRecent = (id: string) => {
-    setAddress(id);
+    handleAddressChange(id);
   };
 
   const handleRemoveRecent = (id: string) => {
@@ -79,7 +100,7 @@ export const ContractCallTab = ({
     <div className="space-y-4">
       <ContractAddressInput
         value={address}
-        onChange={setAddress}
+        onChange={handleAddressChange}
         onLoad={handleLoad}
         isLoading={loading}
         isLoaded={loaded !== null}
@@ -107,7 +128,7 @@ export const ContractCallTab = ({
           <CardContent className="pt-4 space-y-4">
             <div className="space-y-1.5">
               <Label>Function</Label>
-              <Select value={selectedFn} onValueChange={setSelectedFn}>
+              <Select value={selectedFn} onValueChange={handleSelectFunction}>
                 <SelectTrigger>
                   <SelectValue placeholder="Select function" />
                 </SelectTrigger>
@@ -130,6 +151,7 @@ export const ContractCallTab = ({
                 onBuild={onBuild}
                 isBuilding={isBuilding}
                 isTransactionBuilt={isTransactionBuilt}
+                onClearTransaction={onClearTransaction}
               />
             )}
           </CardContent>

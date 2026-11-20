@@ -1,3 +1,4 @@
+import tailwindcssAnimate from "tailwindcss-animate";
 import type { Config } from "tailwindcss";
 
 export default {
@@ -19,10 +20,10 @@ export default {
 		},
     extend: {
       fontFamily: {
-        'sans': ['Inter', 'ui-sans-serif', 'system-ui'],
-        'mono': ['Source Code Pro', 'ui-monospace', 'SFMono-Regular'],
-        'address': ['Source Code Pro', 'ui-monospace', 'SFMono-Regular'],
-        'amount': ['Source Code Pro', 'ui-monospace', 'SFMono-Regular'],
+        'sans': ['Inter Variable', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+        'mono': ['JetBrains Mono Variable', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+        'address': ['JetBrains Mono Variable', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+        'amount': ['JetBrains Mono Variable', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
       colors: {
 				border: 'hsl(var(--border))',
@@ -188,5 +189,5 @@ export default {
 			}
 		}
 	},
-	plugins: [require("tailwindcss-animate")],
+	plugins: [tailwindcssAnimate],
 } satisfies Config;

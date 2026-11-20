@@ -1,4 +1,5 @@
 import { Decimal } from 'decimal.js';
+import { Asset, Networks } from '@stellar/stellar-sdk';
 import type { NetworkId } from './registry';
 
 export interface TokenMeta {
@@ -40,9 +41,70 @@ export const getBuiltinToken = (contract: string, network: NetworkId): TokenMeta
   return hit ? { ...hit, known: true } : undefined;
 };
 
+const passphrase = (network: NetworkId) => (network === 'testnet' ? Networks.TESTNET : Networks.PUBLIC);
+
+/** The Stellar Asset Contract of a classic asset (native XLM without an issuer); null for an invalid code or issuer. */
+export const sacContract = (code: string, issuer: string | undefined, network: NetworkId): string | null => {
+  try {
+    const asset = issuer ? new Asset(code, issuer) : code === 'XLM' ? Asset.native() : null;
+    return asset ? asset.contractId(passphrase(network)) : null;
+  } catch {
+    return null;
+  }
+};
+
+/** A token list entry as far as the app can vouch for it. */
+export type ListedToken =
+  /** A Stellar Asset Contract: code and issuer are bound to the contract address, decimals are 7. */
+  | { contract: string; sac: true; code: string; issuer?: string; decimals: typeof ASSUMED_DECIMALS }
+  /** Any other contract: its name and decimals are only what the list claims. */
+  | { contract: string; sac: false };
+
+/**
+ * Check a token list entry against its contract address. An entry naming a
+ * classic asset (or XLM) must be that asset's Stellar Asset Contract, which is
+ * derived locally; one that is not is dropped (null). Decimals of a Stellar
+ * Asset Contract are always 7, whatever the list says.
+ */
+export const checkListedToken = (
+  entry: { contract?: string; code?: string; issuer?: string },
+  network: NetworkId,
+): ListedToken | null => {
+  const { contract, code, issuer } = entry;
+  if (!contract) return null;
+  if (issuer || contract === sacContract('XLM', undefined, network)) {
+    const claimed = issuer ? code : 'XLM';
+    if (!claimed || sacContract(claimed, issuer, network) !== contract) return null;
+    return { contract, sac: true, code: claimed, ...(issuer ? { issuer } : {}), decimals: ASSUMED_DECIMALS };
+  }
+  // No issuer: a list entry calling itself XLM must be the native contract.
+  if (code === 'XLM') return null;
+  return { contract, sac: false };
+};
+
 /** `CAG5LRYQ…CFAJDDH` — enough to eyeball against a block explorer. */
 export const shortenAddress = (address: string, lead = 6, tail = 6): string =>
   address.length <= lead + tail + 1 ? address : `${address.slice(0, lead)}…${address.slice(-tail)}`;
+
+/**
+ * A typed decimal ("12.5") as a contract integer, without going through floats.
+ * Null when it is not a plain decimal or has more places than the token has.
+ */
+export const parseUnits = (value: string, decimals: number): bigint | null => {
+  const match = /^(\d*)(?:\.(\d*))?$/.exec(value.trim());
+  if (!match || !(match[1] || match[2])) return null;
+  const [, whole, fraction = ''] = match;
+  if (fraction.length > decimals) return null;
+  return BigInt(`${whole || '0'}${fraction.padEnd(decimals, '0')}`);
+};
+
+/** A contract integer as a plain decimal string ("12.5"): exact, ungrouped, fit for an input field. */
+export const formatUnits = (raw: bigint, decimals: number): string => {
+  const digits = (raw < 0n ? -raw : raw).toString().padStart(decimals + 1, '0');
+  const whole = digits.slice(0, digits.length - decimals);
+  const fraction = digits.slice(digits.length - decimals).replace(/0+$/, '');
+  return `${raw < 0n ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;
+};
 
 const grouping = new Intl.NumberFormat('en-US');
 

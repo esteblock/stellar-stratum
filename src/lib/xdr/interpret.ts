@@ -1,3 +1,7 @@
+import { StrKey } from '@stellar/stellar-sdk';
+import { baseAccountId } from '@/lib/signatures';
+import { revealUnsafeChars } from '@/lib/text';
+
 /**
  * Plain-language interpretation of what a transaction actually does to an account.
  *
@@ -33,8 +37,8 @@ export interface AccountSnapshot {
 export type ThresholdLevel = 'low' | 'med' | 'high';
 
 export const THRESHOLD_LABELS: Record<ThresholdLevel, { name: string; hint: string }> = {
-  low: { name: 'Basic operations', hint: 'trustlines, sequence bumps' },
-  med: { name: 'Payments', hint: 'payments, swaps, contract calls' },
+  low: { name: 'Basic operations', hint: 'sequence bumps, claiming balances, trustline authorization' },
+  med: { name: 'Payments', hint: 'payments, swaps, trustlines, contract calls' },
   high: { name: 'Account changes', hint: 'signers, thresholds, account merge' },
 };
 
@@ -127,16 +131,20 @@ export const shortKey = (key: string): string =>
   key.length > 16 ? `${key.slice(0, 8)}…${key.slice(-6)}` : key;
 
 /**
- * A setOptions signer is one of four kinds. Only ed25519 keys are account addresses; the
- * others are hash-based signers that we label rather than pretend are public keys.
+ * A setOptions signer is one of four kinds. The SDK decodes pre-auth and hash(x) signers as
+ * raw bytes, so encode them to the same strkeys Horizon uses (T…, X…, P…): that way a change
+ * lines up with the account's current signer list instead of looking like a new entry.
  */
 const readSignerKey = (signer: Record<string, unknown>): string | null => {
+  const asBytes = (value: unknown) => (value instanceof Uint8Array ? Buffer.from(value) : null);
   if (typeof signer.ed25519PublicKey === 'string') return signer.ed25519PublicKey;
-  if (typeof signer.preAuthTx === 'string') return `preauth:${signer.preAuthTx}`;
-  if (typeof signer.sha256Hash === 'string') return `hashx:${signer.sha256Hash}`;
-  if (typeof signer.ed25519SignedPayload === 'string') return `payload:${signer.ed25519SignedPayload}`;
-  // Some SDK paths hand back an already-normalised { key, weight } pair.
-  if (typeof signer.key === 'string') return signer.key;
+  if (typeof signer.ed25519SignedPayload === 'string') return signer.ed25519SignedPayload;
+  const preAuth = asBytes(signer.preAuthTx);
+  if (preAuth) return StrKey.encodePreAuthTx(preAuth);
+  const hashX = asBytes(signer.sha256Hash);
+  if (hashX) return StrKey.encodeSha256Hash(hashX);
+  if (typeof signer.preAuthTx === 'string') return signer.preAuthTx;
+  if (typeof signer.sha256Hash === 'string') return signer.sha256Hash;
   return null;
 };
 
@@ -149,7 +157,8 @@ const signersNeeded = (
   threshold: number,
   weights: number[],
 ): { minSigners: number | null; anyCombination: boolean } => {
-  if (threshold <= 0) return { minSigners: 0, anyCombination: true };
+  // The network always wants at least one valid signature, even when a threshold is 0.
+  threshold = Math.max(threshold, 1);
 
   const heaviestFirst = [...weights].sort((a, b) => b - a);
   let sum = 0;
@@ -168,11 +177,53 @@ const signersNeeded = (
   return { minSigners, anyCombination: worstCase >= threshold };
 };
 
+/** Ed25519 keys (G…) and signed payloads (P…, signed by a G key) are held by someone. */
+const isHeldKey = (key: string): boolean => key.startsWith('G') || key.startsWith('P');
+
+const keylessSignerRisk = (key: string, weight: number): InterpretationWarning | null => {
+  if (key.startsWith('T')) {
+    return {
+      severity: 'critical',
+      title: 'A transaction you cannot see here could act on this account',
+      detail:
+        `Signer ${shortKey(key)} is the hash of another transaction. After this change anyone can submit that ` +
+        `transaction with no other signature (weight ${weight}). Its content is not part of what you are signing: ` +
+        `do not sign unless you have checked that transaction yourself.`,
+    };
+  }
+  if (key.startsWith('X')) {
+    return {
+      severity: 'critical',
+      title: 'Anyone who knows a secret could sign for this account',
+      detail:
+        `Signer ${shortKey(key)} is a hash(x) signer with weight ${weight}: whoever knows the secret x can sign, ` +
+        `and x becomes public the first time it is used.`,
+    };
+  }
+  if (key.startsWith('P')) {
+    let signerKey = 'a key';
+    try {
+      signerKey = shortKey(StrKey.encodeEd25519PublicKey(StrKey.decodeSignedPayload(key).subarray(0, 32)));
+    } catch {
+      // Keep the generic wording; the key itself is shown in the signer list.
+    }
+    return {
+      severity: 'warning',
+      title: 'A signed-payload signer',
+      detail:
+        `A signature by ${signerKey} over a fixed payload counts as weight ${weight} for any transaction, ` +
+        `not just one it has seen.`,
+    };
+  }
+  return null;
+};
+
 const describeFlags = (mask: number, verb: 'Enables' | 'Disables'): string[] =>
   AUTH_FLAGS.filter(([bit]) => (mask & bit) !== 0).map(([, label]) => `${verb} ${label.toLowerCase()}`);
 
 const interpretMultisig = (
   ops: SetOptionsOp[],
+  sourceAccount: string,
   account: AccountSnapshot | null,
 ): { multisig: MultisigInterpretation; warnings: InterpretationWarning[] } => {
   const warnings: InterpretationWarning[] = [];
@@ -193,10 +244,19 @@ const interpretMultisig = (
 
   // Operations apply in order, so replaying them yields the net effect of the whole batch.
   for (const op of ops) {
-    if (isSet(op.masterWeight) && account) after.set(account.publicKey, op.masterWeight);
+    // The master key is the source account itself, known even without its current state.
+    if (isSet(op.masterWeight)) after.set(sourceAccount, op.masterWeight);
     if (isSet(op.signer)) {
       const key = readSignerKey(op.signer);
-      if (key !== null) after.set(key, op.signer.weight ?? 0);
+      if (key !== null) {
+        after.set(key, op.signer.weight ?? 0);
+      } else {
+        warnings.push({
+          severity: 'critical',
+          title: 'Unreadable signer change',
+          detail: 'A setOptions operation changes a signer this app cannot decode. Do not sign unless you can verify it elsewhere.',
+        });
+      }
     }
     if (isSet(op.lowThreshold)) {
       thresholdsAfter.low = op.lowThreshold;
@@ -220,7 +280,7 @@ const interpretMultisig = (
   for (const [key, afterWeight] of after) {
     const beforeWeight = before.get(key);
     if (beforeWeight === afterWeight) continue;
-    const isMasterKey = account?.publicKey === key;
+    const isMasterKey = key === sourceAccount;
     let kind: SignerChangeKind;
     if (afterWeight === 0) kind = 'removed';
     else if (!knowsState) kind = 'weight-set';
@@ -251,30 +311,28 @@ const interpretMultisig = (
     thresholdsAfter.med !== undefined &&
     thresholdsAfter.high !== undefined;
 
-  const totalWeight = resultingSigners.reduce((sum, s) => sum + s.weight, 0);
+  // Weight that only counts once, or for anyone, is not a key someone holds: a pre-auth
+  // signer is consumed by the one transaction it names, and a hash(x) signer works for whoever
+  // knows x, which becomes public the first time it is used. Lockout checks use held keys only.
+  const keySigners = resultingSigners.filter((s) => isHeldKey(s.key));
+  const totalWeight = keySigners.reduce((sum, s) => sum + s.weight, 0);
   const requirements: SigningRequirement[] = [];
 
   if (canProject) {
-    const weights = resultingSigners.map((s) => s.weight);
+    const weights = keySigners.map((s) => s.weight);
     for (const level of ['low', 'med', 'high'] as const) {
       const threshold = thresholdsAfter[level] as number;
       const { minSigners, anyCombination } = signersNeeded(threshold, weights);
       requirements.push({ level, threshold, minSigners, anyCombination });
 
-      if (minSigners === null) {
+      if (minSigners === null && keySigners.length > 0) {
         warnings.push({
           severity: 'critical',
           title: `${THRESHOLD_LABELS[level].name} would become impossible`,
           detail:
             `The ${THRESHOLD_LABELS[level].name.toLowerCase()} threshold is set to ${threshold}, but the ` +
-            `combined weight of every remaining signer is only ${totalWeight}. No set of signatures could ever ` +
+            `combined weight of every remaining key is only ${totalWeight}. No set of signatures could ever ` +
             `authorise these operations again.`,
-        });
-      } else if (threshold === 0) {
-        warnings.push({
-          severity: 'warning',
-          title: `${THRESHOLD_LABELS[level].name} would need no signatures`,
-          detail: `A threshold of 0 lets anyone submit these operations without any signature.`,
         });
       }
     }
@@ -283,14 +341,9 @@ const interpretMultisig = (
     // it is easy to miss when it is the by-product of a weight bump rather than an explicit
     // threshold edit.
     const highAfter = requirements.find((r) => r.level === 'high');
-    const beforeWeights = account.signers.filter((s) => s.weight > 0).map((s) => s.weight);
+    const beforeWeights = account.signers.filter((s) => s.weight > 0 && isHeldKey(s.key)).map((s) => s.weight);
     const highBefore = signersNeeded(account.thresholds.high, beforeWeights);
-    if (
-      highAfter?.minSigners === 1 &&
-      highBefore.minSigners !== null &&
-      highBefore.minSigners > 1 &&
-      resultingSigners.length > 1
-    ) {
+    if (highAfter?.minSigners === 1 && highBefore.minSigners !== null && highBefore.minSigners > 1) {
       warnings.push({
         severity: 'warning',
         title: 'One signature alone could change this account',
@@ -306,7 +359,22 @@ const interpretMultisig = (
         title: 'Every signer would be removed',
         detail: 'The account would be left with no keys able to sign for it, permanently locking the funds.',
       });
+    } else if (keySigners.length === 0) {
+      warnings.push({
+        severity: 'critical',
+        title: 'No key could sign for this account',
+        detail:
+          'Only pre-authorised transaction or hash(x) signers would remain. Once they are used, nobody could sign ' +
+          'for the account again.',
+      });
     }
+  }
+
+  // Signers that are not keys hand the account to something this transaction does not show.
+  for (const change of signerChanges) {
+    if (change.after === 0 || change.kind === 'weight-lowered') continue;
+    const risk = keylessSignerRisk(change.key, change.after);
+    if (risk) warnings.push(risk);
   }
 
   if (flagChanges.some((f) => f.toLowerCase().includes('authorization immutable'))) {
@@ -359,12 +427,12 @@ export const interpretTransaction = (
   context: { sourceAccount: string; account?: AccountSnapshot | null },
 ): TransactionInterpretation | null => {
   const account = context.account ?? null;
+  // A muxed (M…) source is the same account as its G… base: compare accounts, not spellings.
+  const sourceAccount = baseAccountId(context.sourceAccount);
 
   // An operation with its own source targets a different account, so it must not be folded
   // into this account's before/after picture.
-  const foreign = operations.filter(
-    (op) => (op as SetOptionsOp).source && (op as SetOptionsOp).source !== context.sourceAccount,
-  );
+  const foreign = operations.filter((op) => op.source && baseAccountId(op.source) !== sourceAccount);
   const setOptionsOps = operations.filter(
     (op) => op.type === 'setOptions' && !foreign.includes(op),
   ) as SetOptionsOp[];
@@ -372,15 +440,21 @@ export const interpretTransaction = (
   const foreignSetOptions = foreign.filter((op) => op.type === 'setOptions');
   if (setOptionsOps.length === 0 && foreignSetOptions.length === 0) return null;
 
-  const { multisig, warnings } = interpretMultisig(setOptionsOps, account);
+  const { multisig, warnings } = interpretMultisig(setOptionsOps, sourceAccount, account);
 
   const otherChanges = multisig.flagChanges.map((f) => `${f}.`);
   if (isSet(multisig.homeDomain)) {
+    const domain = revealUnsafeChars(multisig.homeDomain);
     otherChanges.push(
-      multisig.homeDomain === ''
-        ? 'Clears the account’s home domain.'
-        : `Sets the account’s home domain to ${multisig.homeDomain}.`,
+      multisig.homeDomain === '' ? 'Clears the account’s home domain.' : `Sets the account’s home domain to ${domain.text}.`,
     );
+    if (domain.unsafe) {
+      warnings.push({
+        severity: 'warning',
+        title: 'Hidden characters in the home domain',
+        detail: 'The new home domain contains invisible or direction-changing characters, shown as ⟨U+…⟩.',
+      });
+    }
   }
   if (isSet(multisig.inflationDest)) {
     otherChanges.push(`Sets the inflation destination to ${shortKey(multisig.inflationDest)}.`);
@@ -393,7 +467,7 @@ export const interpretTransaction = (
       detail:
         `${foreignSetOptions.length} setOptions operation${foreignSetOptions.length > 1 ? 's' : ''} in this ` +
         `transaction set an explicit source account, so ${foreignSetOptions.length > 1 ? 'they change accounts' : 'it changes an account'} ` +
-        `other than ${shortKey(context.sourceAccount)} and ${foreignSetOptions.length > 1 ? 'are' : 'is'} not reflected below.`,
+        `other than ${shortKey(sourceAccount)} and ${foreignSetOptions.length > 1 ? 'are' : 'is'} not reflected below.`,
     });
   }
 

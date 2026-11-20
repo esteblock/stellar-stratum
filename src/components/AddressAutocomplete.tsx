@@ -3,7 +3,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Clock, Users, QrCode, BookOpen } from 'lucide-react';
 import { useAddressBook, type AddressBookEntry } from '@/hooks/useAddressBook';
-import { isValidPublicKey } from '@/lib/validation';
+import { isValidPaymentDestination } from '@/lib/validation';
 import { cn } from '@/lib/utils';
 
 interface AddressAutocompleteProps {
@@ -95,7 +95,8 @@ export const AddressAutocomplete = ({
   };
 
   const formatAddress = (address: string): string => {
-    return `${address.slice(0, 4)}...${address.slice(-4)}`;
+    // Look-alike addresses share their first and last few characters: show more of it.
+    return `${address.slice(0, 10)}…${address.slice(-10)}`;
   };
 
   return (
@@ -136,7 +137,7 @@ export const AddressAutocomplete = ({
 
 
       {/* Validation status for addresses */}
-      {value && !isValidPublicKey(value) && (
+      {value && !isValidPaymentDestination(value.trim()) && (
         <div className="mt-2 p-2 bg-destructive/10 border border-destructive/20 rounded-lg">
           <span className="text-sm text-destructive">
             Invalid Stellar address format
@@ -155,7 +156,7 @@ export const AddressAutocomplete = ({
               <div className="p-2 border-b border-border">
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Clock className="w-3 h-3" />
-                  {value.trim() ? 'Search results' : 'Recent transactions'}
+                  {value.trim() ? 'Search results' : 'Recent recipients'}
                 </div>
               </div>
               {suggestions.map((entry) => (

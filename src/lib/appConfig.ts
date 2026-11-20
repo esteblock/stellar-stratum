@@ -32,24 +32,28 @@ export const appConfig = {
   ORACLE_CONTRACT: 'CBKGPWGKSKZF52CFHMTRR23TBWTPMRDIYZ4O2P5VS65BMHYH4DXMCJZC',
   
   // Timing constants
-  DEFAULT_TX_TIMEOUT_SECONDS: 300,
+  // Validity window of the transactions the app builds. Collecting multisig signatures through
+  // Refractor or air-gapped QR codes takes time, so this is a day rather than minutes.
+  TX_VALIDITY_SECONDS: 86_400,
   WALLET_CHECK_INTERVAL: 1000,
   WALLET_TIMEOUT: 30000,
 
-  // Limits
-  DEFAULT_BASE_FEE: 100,
   // Base fee in stroops used as per-operation fee for built transactions (0.01 XLM)
   DEFAULT_BASE_FEE_STROOPS: 100_000,
 
-  // Soroswap DEX (public client API key — safe to ship in browser bundle; rotate via Soroswap dashboard if leaked)
+  // Soroswap DEX. The key ships in the browser bundle, so anyone can use it: it only returns
+  // quotes and unsigned transactions (no funds at risk), but it can be over-used or revoked.
+  // Every transaction built from these APIs is checked before signing (protocols/verify.ts).
   SOROSWAP_API_KEY: 'sk_df75c89937e66352dd34d18bf95cdad7704aee94ded214f0c0a30aca1f383ad6',
   SOROSWAP_API_URL: 'https://api.soroswap.finance',
 
-  // DeFindex Vaults (public client API key — safe to ship in browser bundle; rotate via DeFindex dashboard if leaked)
+  // DeFindex vaults. Same caveat as the Soroswap key above.
   DEFINDEX_API_KEY: 'sk_99f6f96ec87e343e985ae5fb79a29e4497eff2de1863e2090787098c55152256',
   DEFINDEX_API_URL: 'https://api.defindex.io',
   DEFINDEX_VAULT_ADDRESS: 'CA2FIPJ7U6BG3N7EOZFI74XPJZOEOD4TYWXFVCIO5VDCHTVAGS6F4UKK',
   DEFINDEX_VAULT_NAME: 'Soroswap USDC Vault',
   // Circle USDC issuer on mainnet (underlying asset of the DeFindex vault) — used to price vault deposits
   USDC_ISSUER_MAINNET: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+  // Circle USDC issuer on testnet: valued at the mainnet USDC price
+  USDC_ISSUER_TESTNET: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
 } as const;

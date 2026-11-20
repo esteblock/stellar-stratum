@@ -112,6 +112,9 @@ const saveTomlToStorage = (key: string, entry: CacheEntry<SEP1TomlAsset[]>) => {
 // Initialize cache from storage
 loadCacheFromStorage();
 
+/** Letters, digits and hyphens in dot-separated labels, ending with an alphabetic TLD. */
+const HOSTNAME = /^(?=.{3,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+
 // Helper function to fetch and cache TOML data for a domain
 const fetchTomlForDomain = async (homeDomain: string, network: 'mainnet' | 'testnet'): Promise<SEP1TomlAsset[]> => {
   const tomlCacheKey = `${homeDomain}:${network}`;
@@ -122,8 +125,8 @@ const fetchTomlForDomain = async (homeDomain: string, network: 'mainnet' | 'test
     return cachedToml.data;
   }
   
-  // Validate domain sanity
-  if (!homeDomain || homeDomain.includes(' ') || homeDomain.length < 3) {
+  // Only a bare public hostname: no IP address, port, path, query or credentials.
+  if (!HOSTNAME.test(homeDomain) || /^[\d.]+$/.test(homeDomain)) {
     // Cache empty result for invalid domains
     const now = Date.now();
     const emptyEntry: CacheEntry<SEP1TomlAsset[]> = {
@@ -216,27 +219,27 @@ const ASSET_FALLBACKS: Record<string, AssetInfo> = {
     code: 'EURC',
     issuer: 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2',
     name: 'Euro Coin',
-    image: '/images/assets/eurc.png'
+    image: `${import.meta.env.BASE_URL}images/assets/eurc.png`
   },
   // USDC from Circle
   'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN': {
     code: 'USDC',
     issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
     name: 'USD Coin',
-    image: '/images/assets/usdc.png'
+    image: `${import.meta.env.BASE_URL}images/assets/usdc.png`
   },
   // BLND from Blend
   'BLND:GDJEHTBE6ZHUXSWFI642DCGLUOECLHPF3KSXHPXTSTJ7E3JF6MQ5EZYY': {
     code: 'BLND',
     issuer: 'GDJEHTBE6ZHUXSWFI642DCGLUOECLHPF3KSXHPXTSTJ7E3JF6MQ5EZYY',
     name: 'Blend',
-    image: '/images/assets/blnd.png'
+    image: `${import.meta.env.BASE_URL}images/assets/blnd.png`
   },
   // Native XLM
   'XLM:': {
     code: 'XLM',
     name: 'Stellar Lumens',
-    image: '/xlm-logo.png'
+    image: `${import.meta.env.BASE_URL}xlm-logo.png`
   }
 };
 

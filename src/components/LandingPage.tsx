@@ -2,26 +2,27 @@ import { useState, Suspense, lazy } from 'react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Wallet, RefreshCw } from 'lucide-react';
+import { openExternal } from '@/lib/utils';
 const WalletConnect = lazy(() => import('@/components/WalletConnect').then(module => ({
   default: module.WalletConnect
 })));
 interface LandingPageProps {
-  onConnect: (walletType: string, publicKey: string, network: 'mainnet' | 'testnet') => void;
+  onConnect: (publicKey: string, network: 'mainnet' | 'testnet') => void;
 }
 export const LandingPage = ({
   onConnect
 }: LandingPageProps) => {
   const [showWalletModal, setShowWalletModal] = useState(false);
   
-  const handleConnect = (walletType: string, publicKey: string, network: 'mainnet' | 'testnet') => {
+  const handleConnect = (publicKey: string, network: 'mainnet' | 'testnet') => {
     setShowWalletModal(false);
-    onConnect(walletType, publicKey, network);
+    onConnect(publicKey, network);
   };
 
   const handleModalControl = (isOpen: boolean) => {
     setShowWalletModal(isOpen);
   };
-  return <div className="h-screen bg-background relative overflow-hidden">
+  return <div className="flex-1 flex flex-col bg-background relative overflow-hidden">
       {/* Subtle Background Elements - Fixed dimensions to prevent shifts */}
       <div className="absolute inset-0 -z-10">
         <div className="absolute inset-0 bg-gradient-to-br from-background to-background/50" style={{ contain: 'layout style paint', willChange: 'auto' }} />
@@ -63,8 +64,8 @@ export const LandingPage = ({
       </header>
 
       {/* Main Content */}
-      <div className="flex items-center justify-center h-screen px-4 sm:px-6">
-        <div className="max-w-6xl mx-auto text-center flex flex-col justify-center h-full py-20 sm:py-24">
+      <div className="flex-1 flex items-center justify-center px-4 sm:px-6">
+        <div className="max-w-6xl mx-auto text-center flex flex-col justify-center py-20 sm:py-24">
           <h1 className="text-4xl sm:text-5xl md:text-6xl lg:text-7xl xl:text-8xl font-black leading-[0.85] mb-4 sm:mb-6 md:mb-8 tracking-tight animate-fade-in">
             <span className="text-foreground">Multi-Signature</span>
             <br />
@@ -90,17 +91,10 @@ export const LandingPage = ({
               size="lg" 
               variant="outline" 
               className="w-full sm:w-auto h-12 sm:h-14 px-6 sm:px-8 md:px-12 text-sm sm:text-base md:text-lg font-semibold border-stellar-yellow text-stellar-yellow hover:bg-stellar-yellow hover:text-black transition-all duration-300 hover:scale-105 hover-scale"
-              onClick={() => window.open('/sign', '_blank')}
+              onClick={() => openExternal(`${import.meta.env.BASE_URL}sign`)}
             >
               Air-gapped Signer
             </Button>
-          </div>
-
-          <div className="mt-8 sm:mt-12 md:mt-16 text-xs sm:text-sm text-muted-foreground animate-fade-in">
-            Built on <span className="text-stellar-yellow font-medium">Stellar</span> by{' '}
-            <a href="https://consulting-manao.com/" target="_blank" rel="noopener noreferrer" className="text-stellar-yellow font-medium hover:underline transition-all duration-300 story-link">
-              Consulting Manao GmbH
-            </a>
           </div>
         </div>
       </div>
@@ -123,7 +117,7 @@ export const LandingPage = ({
                 <span>Loading wallets...</span>
               </div>
             </div>}>
-            <WalletConnect onConnect={handleConnect} onModalControl={handleModalControl} isModal />
+            <WalletConnect onConnect={handleConnect} onModalControl={handleModalControl} />
           </Suspense>
         </DialogContent>
       </Dialog>

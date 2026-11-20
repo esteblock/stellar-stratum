@@ -1,8 +1,9 @@
 import { appConfig } from './appConfig';
 import { submitLog } from './submitLog';
 import { getHorizonUrls } from './horizonSettings';
+import { getTransactionHash } from './xdr/parse';
 
-import { Horizon, Transaction, TransactionBuilder, type FeeBumpTransaction } from '@stellar/stellar-sdk';
+import { AccountRequiresMemoError, Horizon, Transaction, TransactionBuilder, type FeeBumpTransaction } from '@stellar/stellar-sdk';
 
 // Network configuration using centralized config. The Horizon URL honours the user's
 // endpoint settings (custom endpoints and disabled mirrors), see horizonSettings.ts.
@@ -27,7 +28,17 @@ export interface AccountData {
     asset_code?: string;
     asset_issuer?: string;
     balance: string;
+    /** Amount locked in open sell offers; it cannot be spent. */
+    selling_liabilities?: string;
+    limit?: string;
+    liquidity_pool_id?: string;
   }>;
+  /** Current sequence number: the next transaction from this account must use this + 1. */
+  sequence?: string;
+  /** Trustlines, offers, data entries and extra signers: each needs 0.5 XLM of reserve. */
+  subentry_count: number;
+  num_sponsoring: number;
+  num_sponsored: number;
   thresholds: {
     low_threshold: number;
     med_threshold: number;
@@ -69,7 +80,15 @@ export const fetchAccountData = async (publicKey: string, network: 'mainnet' | '
     return {
       publicKey,
       balances: account.balances.map((balance) => {
-        const baseBalance = { asset_type: balance.asset_type, balance: balance.balance };
+        const baseBalance = {
+          asset_type: balance.asset_type,
+          balance: balance.balance,
+          ...('selling_liabilities' in balance ? { selling_liabilities: balance.selling_liabilities } : {}),
+          ...('limit' in balance ? { limit: balance.limit } : {}),
+        };
+        if (balance.asset_type === 'liquidity_pool_shares' && 'liquidity_pool_id' in balance) {
+          return { ...baseBalance, liquidity_pool_id: balance.liquidity_pool_id };
+        }
         if (balance.asset_type !== 'native' && 'asset_code' in balance) {
           return {
             ...baseBalance,
@@ -79,6 +98,10 @@ export const fetchAccountData = async (publicKey: string, network: 'mainnet' | '
         }
         return baseBalance;
       }),
+      sequence: account.sequence,
+      subentry_count: account.subentry_count,
+      num_sponsoring: account.num_sponsoring ?? 0,
+      num_sponsored: account.num_sponsored ?? 0,
       thresholds: {
         low_threshold: account.thresholds.low_threshold,
         med_threshold: account.thresholds.med_threshold,
@@ -102,10 +125,11 @@ export const fetchAccountData = async (publicKey: string, network: 'mainnet' | '
         `Account not found on Stellar ${networkName}. ` +
           `This account doesn't exist yet. To use this account, you need to either: ` +
           `1) Switch to the correct network, or 2) Fund the account first to activate it on ${networkName}.`,
+        { cause: error },
       );
     }
     const original = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to load account data from Horizon: ${original}`);
+    throw new Error(`Failed to load account data from Horizon: ${original}`, { cause: error });
   }
 };
 
@@ -117,9 +141,11 @@ export const fetchAccountData = async (publicKey: string, network: 'mainnet' | '
 const getSorobanResourceFee = (transaction: Transaction | FeeBumpTransaction): number => {
   try {
     const inner = 'innerTransaction' in transaction ? transaction.innerTransaction : transaction;
-    const tx = inner.toEnvelope().v1().tx();
-    if (tx.ext().switch() !== 1) return 0;
-    return Number(tx.ext().sorobanData().resourceFee().toString());
+    const envelope = inner.toEnvelope();
+    if (envelope.type !== 'envelopeTypeTx') return 0;
+    const { ext } = envelope.v1.tx;
+    if (ext.type !== 'sorobanData') return 0;
+    return Number(ext.sorobanData.resourceFee);
   } catch {
     return 0;
   }
@@ -168,20 +194,63 @@ const hostOf = (url: string) => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Look a transaction hash up on every known Horizon; first hit wins. */
-const findTransactionAnywhere = async (
-  hash: string,
-  urls: string[],
-): Promise<Horizon.ServerApi.TransactionRecord | null> => {
-  const lookups = urls.map(async (url) => {
-    try {
-      return await new Horizon.Server(url).transactions().transaction(hash).call();
-    } catch {
-      return null;
-    }
-  });
-  const results = await Promise.all(lookups);
-  return results.find((r): r is Horizon.ServerApi.TransactionRecord => r !== null) ?? null;
+interface Sighting {
+  record: Horizon.ServerApi.TransactionRecord;
+  host: string;
+  /** Reported by the user's primary Horizon rather than a third-party mirror. */
+  primary: boolean;
+}
+
+/**
+ * Look a transaction hash up on every known Horizon (each capped at 5s, so a slow mirror can't
+ * stall it). The primary Horizon's answer wins; a mirror's only counts for the hash asked for.
+ */
+const findTransactionAnywhere = async (hash: string, urls: string[]): Promise<Sighting | null> => {
+  const lookups = await Promise.allSettled(
+    urls.map(async (url) => {
+      const record = await Promise.race([
+        new Horizon.Server(url).transactions().transaction(hash).call(),
+        sleep(5_000).then(() => null),
+      ]);
+      if (!record || record.hash !== hash) throw new Error('not found');
+      return record;
+    }),
+  );
+  const sightings = lookups.flatMap((lookup, index) =>
+    lookup.status === 'fulfilled' ? [{ record: lookup.value, host: hostOf(urls[index]), primary: index === 0 }] : [],
+  );
+  return sightings.find((s) => s.primary) ?? sightings[0] ?? null;
+};
+
+/** Plain-language reasons for the result codes people actually hit. */
+const RESULT_CODE_HINTS: Record<string, string> = {
+  tx_bad_seq: 'the sequence number was already used (another transaction from this account went through first). Rebuild the transaction and collect the signatures again',
+  tx_too_late: 'the transaction expired before it was submitted. Rebuild it and collect the signatures again',
+  tx_too_early: 'the transaction is not valid yet (its time bounds start later)',
+  tx_bad_auth: 'the signatures do not reach the required threshold, or one was made for another network',
+  tx_bad_auth_extra: 'the transaction carries a signature that is not needed; remove it and submit again',
+  tx_insufficient_balance: 'the source account cannot pay the fee',
+  tx_insufficient_fee: 'the fee is too low for current network load',
+  op_underfunded: 'an account does not hold enough of the asset being sent (keep the minimum XLM reserve in mind)',
+  op_low_reserve: 'the operation would leave an account below its minimum XLM reserve',
+  op_no_trust: 'the destination has no trustline for the asset',
+  op_not_authorized: 'the issuer has not authorised this trustline',
+  op_line_full: 'the destination trustline limit would be exceeded',
+  op_no_destination: 'the destination account does not exist; send at least 1 XLM to create it',
+  op_under_dest_min: 'the path payment would deliver less than the minimum (the price moved)',
+  op_over_source_max: 'the path payment would cost more than the maximum (the price moved)',
+  op_too_few_offers: 'there is no market path between these assets right now',
+  op_has_sub_entries: 'the account still has trustlines, offers or data entries and cannot be merged',
+  op_is_sponsor: 'the account sponsors other entries and cannot be merged',
+  op_bad_auth: 'an operation does not have enough signature weight for its source account',
+};
+
+type ResultCodes = { transaction?: string; operations?: string[] };
+
+const describeResultCodes = (codes: ResultCodes): string => {
+  const all = [codes.transaction, ...(codes.operations || [])].filter((c): c is string => Boolean(c) && c !== 'op_success');
+  const hints = [...new Set(all.map((c) => RESULT_CODE_HINTS[c]).filter(Boolean))];
+  return `${all.join(', ')}${hints.length ? `: ${hints.join('; ')}` : ''}`;
 };
 
 /**
@@ -203,9 +272,9 @@ export const submitTransaction = async (
   try {
     const config = getNetworkConfig(network);
     const urls = getHorizonUrls(network);
-    const transaction = TransactionBuilder.fromXDR(signedXdr, config.passphrase);
+    const transaction = TransactionBuilder.fromXdr(signedXdr, config.passphrase);
     const inner = 'innerTransaction' in transaction ? transaction.innerTransaction : transaction;
-    const hash = transaction.hash().toString('hex');
+    const hash = getTransactionHash(transaction);
     submitLog.info('parsed signed envelope', {
       network,
       horizons: urls.map(hostOf),
@@ -240,8 +309,26 @@ export const submitTransaction = async (
       submitLog.info('could not fetch fee stats', feeError);
     }
 
-    const alreadyIncluded = (found: Horizon.ServerApi.TransactionRecord) => {
-      submitLog.ok(`transaction is in ledger ${found.ledger_attr} after ${elapsed()}`, { hash: found.hash, successful: found.successful });
+    const alreadyIncluded = ({ record: found, host, primary }: Sighting) => {
+      if (!found.successful) {
+        if (!primary) {
+          // A third-party mirror alone cannot prove a failure: rebuilding on its word could pay twice.
+          submitLog.error(`${host} reports the transaction FAILED in ledger ${found.ledger_attr}; the primary Horizon has not confirmed it`, { hash });
+          throw new Error(
+            `${host} reports that the transaction failed, but your Horizon has not confirmed it. ` +
+              `Check hash ${hash} on an explorer before building it again.`,
+          );
+        }
+        // Included in a ledger but failed: the fee and sequence number are spent, nothing else happened.
+        submitLog.error(`transaction is in ledger ${found.ledger_attr} but FAILED`, { hash: found.hash, result_xdr: found.result_xdr });
+        throw new Error(`The transaction was included in ledger ${found.ledger_attr} but failed, so nothing was transferred (the fee was charged).`);
+      }
+      submitLog.ok(
+        primary
+          ? `transaction is in ledger ${found.ledger_attr} after ${elapsed()}`
+          : `${host} reports the transaction in ledger ${found.ledger_attr} after ${elapsed()} (not confirmed by the primary Horizon: check the hash on an explorer)`,
+        { hash: found.hash },
+      );
       return found as unknown as Horizon.HorizonApi.SubmitTransactionResponse;
     };
 
@@ -257,9 +344,18 @@ export const submitTransaction = async (
             throw new Error(`no answer from ${host} within ${appConfig.HORIZON_SUBMIT_ATTEMPT_MS / 1000}s`);
           }),
         ]);
+        if (result.hash !== hash) throw new Error(`${host} answered for another transaction (${result.hash})`);
         submitLog.ok(`${host} accepted the transaction after ${attemptElapsed()} (total ${elapsed()})`, { hash: result.hash, ledger: result.ledger, successful: result.successful });
         return result;
       } catch (attemptError) {
+        // The SDK checks SEP-29 before posting: the destination (usually an exchange) needs a memo.
+        if (attemptError instanceof AccountRequiresMemoError) {
+          throw new Error(
+            `${attemptError.accountId} requires a memo (it is probably an exchange deposit address). ` +
+              'Add the memo they gave you and rebuild the transaction.',
+            { cause: attemptError },
+          );
+        }
         const horizonError = asHorizonError(attemptError);
         const status = horizonError.response?.status;
         const codes = horizonError.response?.data?.extras?.result_codes;
@@ -267,9 +363,11 @@ export const submitTransaction = async (
         const isRejection = status === 400 && codes !== undefined && codes.transaction !== 'tx_timeout';
 
         if (isRejection) {
-          // Could be tx_bad_seq because an earlier attempt already got it into a ledger.
-          const found = await findTransactionAnywhere(hash, urls);
-          if (found) return alreadyIncluded(found);
+          // tx_bad_seq can mean an earlier attempt already got it into a ledger.
+          if (codes.transaction === 'tx_bad_seq') {
+            const found = await findTransactionAnywhere(hash, urls);
+            if (found) return alreadyIncluded(found);
+          }
           submitLog.error(`${host} rejected the transaction after ${attemptElapsed()}`, {
             status,
             title: horizonError.response?.data?.title,
@@ -320,15 +418,15 @@ export const submitTransaction = async (
       raw: error,
     });
     const codes = horizonError.response?.data?.extras?.result_codes;
-    const codeSummary = codes
-      ? ` (${[codes.transaction, ...(codes.operations || [])].filter(Boolean).join(', ')})`
-      : '';
-    const base = error instanceof Error ? error.message : 'Failed to submit transaction';
-    throw new Error(`${base}${codeSummary}`);
+    if (codes) throw new Error(`The network rejected the transaction (${describeResultCodes(codes)}).`, { cause: error });
+    throw new Error(error instanceof Error ? error.message : 'Failed to submit transaction', { cause: error });
   }
 };
 
-// Refractor integration functions
+// Refractor (refractor.space) stores a transaction so co-signers can add signatures, for both
+// networks. Its ID is the transaction hash on the network it was posted for.
+const refractorNetwork = (network: 'mainnet' | 'testnet') => (network === 'testnet' ? 'testnet' : 'public');
+
 export const submitToRefractor = async (xdr: string, network: 'mainnet' | 'testnet'): Promise<string> => {
   try {
     const response = await fetch(`${appConfig.REFRACTOR_API_BASE}`, {
@@ -337,8 +435,7 @@ export const submitToRefractor = async (xdr: string, network: 'mainnet' | 'testn
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      // Refractor always speaks to public network XDR regardless of client network.
-      body: JSON.stringify({ network: 'public', xdr }),
+      body: JSON.stringify({ network: refractorNetwork(network), xdr }),
     });
 
     if (!response.ok) {
@@ -346,40 +443,41 @@ export const submitToRefractor = async (xdr: string, network: 'mainnet' | 'testn
       throw new Error(`Refractor API error: ${response.status} - ${errorText}`);
     }
 
-    // Compute hash (ID) to share based on network
-    const config = getNetworkConfig(network);
-    const tx = TransactionBuilder.fromXDR(xdr, config.passphrase);
-    return tx.hash().toString('hex');
+    const result = await response.json();
+    const expected = getTransactionHash(TransactionBuilder.fromXdr(xdr, getNetworkConfig(network).passphrase));
+    if (result?.hash !== expected) {
+      throw new Error('Refractor stored the transaction under an unexpected ID');
+    }
+    return expected;
   } catch (error) {
-    throw new Error(`Failed to submit to Refractor: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    throw new Error(`Failed to submit to Refractor: ${error instanceof Error ? error.message : 'Unknown error'}`, { cause: error });
   }
 };
 
-export const pullFromRefractor = async (refractorId: string): Promise<string> => {
-  try {
-    const response = await fetch(`${appConfig.REFRACTOR_API_BASE}/${refractorId}`);
-    if (!response.ok) throw new Error('Failed to fetch from Refractor');
+export const pullFromRefractor = async (
+  refractorId: string,
+): Promise<{ xdr: string; network: 'mainnet' | 'testnet' }> => {
+  const response = await fetch(`${appConfig.REFRACTOR_API_BASE}/${encodeURIComponent(refractorId)}`);
+  if (response.status === 404) throw new Error('No transaction with this ID on Refractor');
+  if (!response.ok) throw new Error(`Refractor API error: ${response.status}`);
 
-    const result = await response.json();
-    const xdr = result?.xdr;
-    if (typeof xdr !== 'string' || xdr.length < 100) {
-      throw new Error('Refractor returned an invalid XDR payload');
-    }
-
-    // Validate XDR parses on at least one known network before handing it back
-    let parses = false;
-    for (const passphrase of [appConfig.MAINNET_PASSPHRASE, appConfig.TESTNET_PASSPHRASE]) {
-      try {
-        TransactionBuilder.fromXDR(xdr, passphrase);
-        parses = true;
-        break;
-      } catch {
-        /* try next */
-      }
-    }
-    if (!parses) throw new Error('Refractor returned a payload that is not a valid Stellar transaction');
-    return xdr;
-  } catch (error) {
-    throw new Error(error instanceof Error ? error.message : 'Failed to fetch transaction from Refractor');
+  const result = await response.json();
+  const xdr = result?.xdr;
+  if (typeof xdr !== 'string' || !xdr) throw new Error('Refractor returned an invalid XDR payload');
+  if (result.network !== 'public' && result.network !== 'testnet') {
+    throw new Error(`Refractor returned an unknown network: ${String(result.network)}`);
   }
+  const network = result.network === 'testnet' ? 'testnet' : 'mainnet';
+  let hash: string;
+  try {
+    hash = getTransactionHash(TransactionBuilder.fromXdr(xdr, getNetworkConfig(network).passphrase));
+  } catch {
+    throw new Error('Refractor returned a payload that is not a valid Stellar transaction');
+  }
+  // The ID is the transaction hash, which commits to the network: a different transaction, or
+  // the same one claimed for the other network, cannot match it.
+  if (hash !== refractorId.trim().toLowerCase()) {
+    throw new Error('Refractor returned a different transaction than the one requested');
+  }
+  return { xdr, network };
 };
